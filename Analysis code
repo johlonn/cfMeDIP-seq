@@ -1,0 +1,274 @@
+# cfMeDIP-seq pipeline -------------------------------
+rm(list = ls())
+getwd()
+
+##### 1. Libraries #####
+library (Rsamtools)
+library (MEDIPS)
+library (BSgenome.Hsapiens.UCSC.hg19)
+library (GenomicAlignments)
+library (biomaRt)
+library (ggplot2)
+library (gplots)
+library (RColorBrewer)
+library (reshape)
+
+
+##### 2. Bam preparations #####
+
+# Choose path to the .bam and .bai files
+bamdir <- ("S:/Personal Folders/Sequencing")
+
+# Find the bam files
+bam.A <- file.path(bamdir, "cfmedip_b4_1_single.sorted.bam")
+bam.B <- file.path(bamdir, "cfmedip_b4_2_single.sorted.bam") 
+bam.C <- file.path(bamdir, "cfmedip_b4_3_single.sorted.bam") 
+
+
+##### 3. Decide parameters #####
+
+# Reference genome
+BSgenome = "BSgenome.Hsapiens.UCSC.hg19"
+
+# Parameters
+un   = 1e-3      # Maximum stacked reads
+ex   = 300       # Extend read to 300nt
+sh   = 0         # Shift instead of extend, either extend or shift has to be zero
+ws   = 100       # Genome divided into windows of length 100nt
+
+# Specify which chromosome is analyzed
+chr = "chr2"                   # Single chromosome test
+chr <- paste0("chr", c(1:4))   # Range of chromosome test
+chr <- paste0("chr", c(1:22, "X", "Y")) # All chromosomes
+
+# Controls
+MEDIPS.saturation (file = bam.A, BSgenome = BSgenome, chr.select = chr) # All bam-files
+MEDIPS.CpGenrich (file = bam.A, BSgenome = BSgenome, chr.select = chr) # One chromosome at the time, and all bam-files
+
+
+##### 4. Create set MeDIPs #####
+
+## Sample 1 - Healthy patient time point 1 ##
+Me.A = MEDIPS.createSet(file = bam.A, 
+                        BSgenome = BSgenome, extend = ex,
+                        shift = sh, uniq = un, window_size = ws,
+                        chr.select = chr)
+
+## Sample 2 - healthy patient time point 2 ##
+Me.B = MEDIPS.createSet(file = bam.B, 
+                        BSgenome = BSgenome, extend = ex,
+                        shift = sh, uniq = un, window_size = ws,
+                        chr.select = chr) 
+
+## Sample 3 - test sample ##
+Me.C = MEDIPS.createSet(file = bam.C, 
+                        BSgenome = BSgenome, extend = ex,
+                        shift = sh, uniq = un, window_size = ws,
+                        chr.select = chr)
+                
+                
+##### 5. MeDIPs bonferroni #####
+
+# Three conditions
+Me.all <- c(Me.A, Me.B, Me.C)
+
+# Create coupling vector
+CS = MEDIPS.couplingVector(pattern = "CG", refObj = Me.all)
+
+## Sample 1 vs Sample 2 ##
+mr.edgeR.AB = MEDIPS.meth(MSet1 = Me.A, MSet2 = Me.B, CSet = CS,
+                          p.adj = "bonferroni", diff.method = "edgeR", 
+                          MeDIP = T, CNV = F, minRowSum = 10)
+                          
+## Sample 2 vs Sample 3 ##
+mr.edgeR.BC = MEDIPS.meth(MSet1 = Me.B, MSet2 = Me.C, CSet = CS,
+                          p.adj = "bonferroni", diff.method = "edgeR", 
+                          MeDIP = T, CNV = F, minRowSum = 10)
+                          
+## Sample 1 vs Sample 3 ##             
+mr.edgeR.AC = MEDIPS.meth(MSet1 = Me.A, MSet2 = Me.C, CSet = CS,
+                          p.adj = "bonferroni", diff.method = "edgeR", 
+                          MeDIP = T, CNV = F, minRowSum = 10)
+                          
+                          
+##### 6. Annotation and bed-file for IGV #####
+
+# Erase NA from table
+AB.sig <- AB[!is.na(AB$edgeR.adj.p.value),]
+
+# Filter p-values under 0.05
+AB.sig <- AB.sig[AB.sig$edgeR.adj.p.value<0.05,]
+
+## Annotation for genes ##
+anno.mart.gene = MEDIPS.getAnnotation(dataset=c("hsapiens_gene_ensembl"), 
+                                      annotation = c("GENE"), chr = chr)
+Genes.AB = MEDIPS.setAnnotation(regions = AB.sig, annotation = anno.mart.gene)
+
+## Take away any genes without annotation ##
+
+# Rename column where names is "1_id"
+colnames(Genes.AB)
+names(Genes.AB)[names(Genes.AB) == "1_id"] <- "Gene.1"
+
+# Filter out the NA from gene list
+Genes.AB.fil <- Genes.AB[!is.na(Genes.AB$Gene.1),]
+
+# Create a new list with chosen information
+end <- ncol(Genes.AB)
+Output.Genes.AB <- Genes.AB.fil[,c(1:3,5:8,17:end)]
+name <- row.names(Output.Genes.AB)
+Output.Genes.AB <- cbind(name, Output.Genes.AB)
+
+# Create the bed-file
+setwd("S:/Personal Folders/Sequencing")
+name.file <- "annotatedGeneAB.bed"
+write.table(Output.Genes.AB, name.file, sep = "\t",
+            quote = F, row.names = F)
+
+## Annotation for promotors ##
+anno.mart.tss = MEDIPS.getAnnotation(dataset=c("hsapiens_gene_ensembl"), 
+                                     annotation = c( "TSS"), tssSz=c(-1000,500),
+                                     chr = chr)
+TSS.AB = MEDIPS.setAnnotation(regions = AB.sig, annotation = anno.mart.tss)
+# Then create bed-file for promoters the same way as for creating bed-files with annotated gene
+
+
+##### 7. Merge regions of interest #####
+
+### Sample 1 over Sample 3 example ###
+# Merging regions with positive log2FC
+AC.gain = mr.edgeR.AC[which(mr.edgeR.AC[, grep("logFC", colnames(mr.edgeR.AC))] > 0), ]
+AC.gain.m = MEDIPS.mergeFrames(frames = AC.gain, distance = 1)
+columns = names(mr.edgeR.AC)[grep("edgeR", names(mr.edgeR.AC))]
+rois.s = MEDIPS.selectROIs(results = mr.edgeR.AC, rois = AC.gain.m,
+                           columns = columns, summarize = "avg")
+
+# Merging regions with negative log2FC
+AC.less = mr.edgeR.AC[which(mr.edgeR.AC[, grep("logFC", colnames(mr.edgeR.AC))] < 0), ]
+AC.less.m = MEDIPS.mergeFrames(frames = AC.less, distance = 1)
+columns = names(mr.edgeR.AC)[grep("edgeR", names(mr.edgeR.AC))]
+rois.l.s = MEDIPS.selectROIs(results = mr.edgeR.AC, rois = AC.less.m,
+                           columns = columns, summarize = "avg")
+
+# Combine all merged regions to one list
+total.AC <- rbind(rois.s, rois.l.s)
+
+# Only significant merged regions
+significant <- total.AC$edgeR.adj.p.value < 0.05
+total.AC$Significant <- significant
+
+
+## Annotate merged regions within gene body ##
+AC.tot.anno = MEDIPS.setAnnotation(regions = total.AC, 
+                                     annotation = anno.mart.gene)
+colnames(AC.tot.anno)
+names(AC.tot.anno)[names(AC.tot.anno) == "1_id"] <- "ensembl_gene_id"
+
+# Remove genes without annotation
+AC.tot.anno.fil <- AC.tot.anno[!is.na(AC.tot.anno$ensembl_gene_id),]
+
+# Add HGNC-symbol
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+genes <- AC.tot.anno.fil$ensembl_gene_id
+
+G_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"), values=genes, mart= mart)
+AC.tot.anno.fil2 <- merge(AC.tot.anno.fil, G_list, by="ensembl_gene_id")
+AC.tot.anno.fil3 <- distinct(AC.tot.anno.fil2)
+
+
+## Annotate merged regions in promoters ##
+AC.tot.tss = MEDIPS.setAnnotation(regions = total.AC, annotation = anno.mart.tss)
+colnames(AC.tot.tss)
+names(AC.tot.tss)[names(AC.tot.tss) == "1_id"] <- "ensembl_transcript_id"
+
+# Remove promoters without annotation
+AC.tot.tss.fil <- AC.tot.tss[!is.na(AC.tot.tss$ensembl_transcript_id),]
+
+# Add HGNC symbol
+AC.tot.tss.fil$ensembl_transcript_id <- gsub("^.{0,4}", "", AC.tot.tss.fil$ensembl_transcript_id)
+
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+tss <- AC.tot.tss.fil$ensembl_transcript_id
+
+Tss_list <- getBM(filters= "ensembl_transcript_id", attributes= c("ensembl_transcript_id", "hgnc_symbol"), values=tss, mart= mart)
+AC.tot.tss.fil2 <- merge(AC.tot.tss.fil, Tss_list, by="ensembl_transcript_id")
+AC.tot.tss.fil3 <- distinct(AC.tot.tss.fil2)
+
+
+##### 8. Volcano plot example #####
+
+png("Healthy1testgene.png",height=300,width=400)
+ggplot(data=AC.tot.anno.fil3, 
+       aes(x=edgeR.logFC, y=-log10(edgeR.adj.p.value), col=Significant)) + 
+  geom_point(alpha=0.8, size=2.2) + 
+  scale_color_manual(values=c("darkorchid4", "grey"),
+                    breaks = c("TRUE", "FALSE"),
+                    labels = c("Significant", "Not significant")) +
+  theme_bw() + 
+  theme(legend.title = element_blank()) +
+  geom_text_repel(aes(x = edgeR.logFC, y = -log10(edgeR.adj.p.value),label = ifelse(Significant == T, hgnc_symbol,"")), nudge_y = -1) + 
+  ggtitle("Gene body") + 
+  xlab("Log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(text = element_text(family ="serif", size = 14)) +
+  ylim(0,18)
+dev.off()
+
+
+##### 9. PCA plot #####
+
+# Extract counts data from data-frame
+cfmedip_b4_1_counts <- mr.edgeR.AC[,5]
+cfmedip_b4_2_counts <- mr.edgeR.BC[,5]
+cfmedip_b4_3_counts <- mr.edgeR.AC[,6]
+Counts2 <- cbind(cfmedip_b4_1_counts, cfmedip_b4_2_counts, cfmedip_b4_3_counts)
+
+# Prepare data for Principal Component Analysis
+sd <- rowSds(Counts2)
+sd2 <- as.data.frame(sd)
+Counts3 <- cbind(Counts2, sd2)
+Counts5 <- subset(Counts3, sd2 > 0)
+Counts6 <- Counts5[,1:3]
+Counts7 <- t(Counts6)
+
+# PCA
+pca_res <- prcomp(Counts7, scale=TRUE)
+summary(pca_res)
+pca <- as.data.frame(pca_res$x)
+
+Sample <- c("Healthy 1", "Healthy 2", "Test")
+pca1 <- cbind(pca, Sample)
+
+# Plot PC1 vs PC2
+png("PCAhealthy.png",height=300,width=550)
+ggplot(data = pca2, aes(x=PC1,y=PC2)) + geom_point(aes(color = Sample), size=2.7) +
+  theme_bw(base_size = 15) + scale_color_manual(values= c("steelblue2", "dodgerblue4", "darkorchid4")) + xlab("PC1 [97.2 %]") + ylab("PC2 [2.8 %]") +
+  ggtitle("PCA of the fourth sample set") + 
+  theme(plot.title = element_text(hjust = 0.6)) +
+  theme(text = element_text(family ="serif"))
+dev.off()
+
+
+##### 10. Heat-map #####
+
+# Prepare list of significant genes
+xsig <- Sig.ABC[,c(1:3)]
+xsig2 <- xsig[c(1,4:5,7:11,13:17),]
+rownames(xsig2) <- xsig2[,1]
+xsig2[,1] <- NULL 
+view(xsig)
+xsig2 <- melt(xsig)
+xsig3 <- as.matrix(xsig2)
+colnames(xsig3) <- c("First time point", "Second time point")
+
+# Define colours
+mypalette = brewer.pal(5,"BuPu")
+morecols = colorRampPalette(mypalette)
+mycols=rev(morecols(255))
+
+# Plot heat-map
+png("GenesHeatmap2.png",height = 600,width = 450, pointsize = 12)
+heatmap.2(xsig3, trace ='none', col = mycols, main = 'Significant genes',
+          margins = c(12,12), cexCol = 1.5)
+dev.off()
